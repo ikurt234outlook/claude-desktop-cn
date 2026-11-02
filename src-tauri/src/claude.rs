@@ -17,6 +17,11 @@ use std::{
 const FAMILY: &str = "Claude_pzs8sxrjxfjjc";
 pub(crate) const APP_ID: &str = "Claude_pzs8sxrjxfjjc!Claude";
 const MSIX_URL: &str = "https://api.anthropic.com/api/desktop/win32/x64/msix/latest/redirect";
+/// Anthropic's alternate feed host. The app's own `updateViaUpdatesHost` setting
+/// reads releases.claude.com so that api.anthropic.com can stay blocked; it
+/// serves the same signed MSIX and answers where api.anthropic.com returns 403.
+const MSIX_UPDATES_URL: &str =
+    "https://releases.claude.com/api/desktop/win32/x64/msix/latest/redirect";
 const MSIX_DIR: &str = "official-msix";
 const MSIX_PREFIX: &str = "Claude-";
 const MSIX_SUFFIX: &str = ".msix";
@@ -36,6 +41,17 @@ pub fn clean_cache(data: &Path) -> Vec<String> {
     errors
 }
 
+/// How the current Claude Desktop is installed. A portable copy is a plain
+/// directory extracted from the official MSIX; it may still be Appx-registered
+/// for Cowork, but the assistant manages it by path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaudeTargetKind {
+    #[default]
+    Appx,
+    Portable,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ClaudePackage {
@@ -44,6 +60,8 @@ pub struct ClaudePackage {
     pub version: String,
     pub architecture: String,
     pub install_location: String,
+    #[serde(default)]
+    pub kind: ClaudeTargetKind,
 }
 
 impl ClaudePackage {
@@ -67,6 +85,7 @@ pub struct ClaudeStatus {
     pub version: String,
     pub package_full_name: String,
     pub install_path: String,
+    pub kind: ClaudeTargetKind,
     pub applied_mode: Option<String>,
     pub backup_ready: bool,
     pub external_localization: bool,
@@ -81,7 +100,14 @@ pub struct ClaudeStatus {
     pub update_checking: bool,
 }
 
+/// Resolves the Claude Desktop the assistant manages. A portable install the
+/// user set up here wins over an official Appx package, because it is the
+/// explicit choice made in this assistant.
 pub fn query_package() -> Result<Option<ClaudePackage>, String> {
+    #[cfg(windows)]
+    if let Some(package) = crate::portable::query()? {
+        return Ok(Some(package));
+    }
     let script = format!(
         "$items = @(Get-AppxPackage -Name Claude | Where-Object {{ $_.PackageFamilyName -eq '{}' -and $_.Architecture -eq 'X64' }}); if ($items.Count -gt 1) {{ throw '当前用户有多个 Claude x64 包，无法确定目标。' }}; if ($items.Count -eq 1) {{ $items[0] | Select-Object PackageFullName,PackageFamilyName,Version,InstallLocation,@{{Name='Architecture';Expression={{$_.Architecture.ToString()}}}} | ConvertTo-Json -Compress -Depth 3 }}",
         FAMILY
@@ -97,6 +123,12 @@ pub fn query_package() -> Result<Option<ClaudePackage>, String> {
 }
 
 fn validate_package(package: &ClaudePackage) -> Result<(), String> {
+    if package.kind == ClaudeTargetKind::Portable {
+        if !package.install_location.trim().is_empty() && package.exe().is_file() {
+            return Ok(());
+        }
+        return Err("便携版 Claude 目录无效或已被移动。".into());
+    }
     if package.package_family_name != FAMILY || !package.architecture.eq_ignore_ascii_case("X64") {
         return Err("检测到的包不是官方 Claude Desktop x64。".into());
     }
@@ -125,6 +157,7 @@ pub fn status() -> Result<ClaudeStatus, String> {
             version: String::new(),
             package_full_name: String::new(),
             install_path: String::new(),
+            kind: ClaudeTargetKind::default(),
             applied_mode: None,
             backup_ready: false,
             external_localization: false,
@@ -147,6 +180,7 @@ pub fn status() -> Result<ClaudeStatus, String> {
         version: package.version.clone(),
         package_full_name: package.package_full_name.clone(),
         install_path: package.install_location.clone(),
+        kind: package.kind,
         applied_mode: state.applied_mode,
         backup_ready: state.backup_ready,
         external_localization: state.external_localization,
@@ -187,22 +221,61 @@ fn current_update_available(
 }
 
 pub fn launch() -> Result<(), String> {
-    let package = query_package()?.ok_or_else(|| "未安装官方 Claude Desktop。".to_string())?;
-    let mut command = Command::new("explorer.exe");
-    util::hide_window(&mut command);
-    command
-        .arg(format!(r"shell:AppsFolder\{APP_ID}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("启动 Claude Desktop 失败：{error}"))?;
+    let package = query_package()?.ok_or_else(|| "未安装 Claude Desktop。".to_string())?;
+    match package.kind {
+        ClaudeTargetKind::Appx => {
+            let mut command = Command::new("explorer.exe");
+            util::hide_window(&mut command);
+            command
+                .arg(format!(r"shell:AppsFolder\{APP_ID}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("启动 Claude Desktop 失败：{error}"))?;
+        }
+        ClaudeTargetKind::Portable => {
+            let registered = crate::portable::record()?
+                .filter(|record| record.registered)
+                .map(|record| record.package_family_name)
+                .filter(|family| !family.trim().is_empty());
+            if let Some(family) = registered {
+                // A registered copy must start through its package identity,
+                // otherwise the declared Cowork service is unavailable.
+                let mut command = Command::new("explorer.exe");
+                util::hide_window(&mut command);
+                command
+                    .arg(format!(r"shell:AppsFolder\{}!Claude", family.trim()))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|error| format!("启动便携版 Claude 失败：{error}"))?;
+            } else {
+                // Same command line as the generated Claude.cmd, without a console
+                // window: an unregistered copy keeps its data inside its folder.
+                let data = package.root().join("data");
+                fs::create_dir_all(&data)
+                    .map_err(|error| format!("创建便携数据目录失败：{error}"))?;
+                let mut command = Command::new(package.exe());
+                command
+                    .arg("--user-data-dir")
+                    .arg(&data)
+                    .current_dir(package.root().join("app"))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                util::hide_window(&mut command);
+                command
+                    .spawn()
+                    .map_err(|error| format!("启动便携版 Claude 失败：{error}"))?;
+            }
+        }
+    }
     for _ in 0..20 {
         if desktop_running(&package)? {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    Err("已发送 Claude Desktop 启动请求，但未检测到该 Appx 的进程。".into())
+    Err("已发送 Claude Desktop 启动请求，但未检测到该应用的进程。".into())
 }
 
 fn desktop_running(package: &ClaudePackage) -> Result<bool, String> {
@@ -320,6 +393,36 @@ fn run_desktop_script(contents: &str, operation: &OperationState) -> Result<(), 
 
 pub(crate) fn close_desktop_script(package: &ClaudePackage, sid: &str, session: u32) -> String {
     let job_helper = include_str!("claude_job.cs");
+    // A portable copy has no package identity to assert, and its process tree is
+    // matched by executable path alone.
+    let job_close = if package.kind == ClaudeTargetKind::Appx {
+        format!(
+            "[ClaudeDesktopJob]::Close({}, $callerSid, [uint32]$session)",
+            ps_quote(&package.package_full_name)
+        )
+    } else {
+        String::new()
+    };
+    // A portable copy shares no identity with an installed Appx, so another
+    // installation's Cowork service is none of its business.
+    let cowork_foreign = if package.kind == ClaudeTargetKind::Appx {
+        "    else { throw 'CoworkVMService 不属于当前 Claude 包，已停止操作。' }"
+    } else {
+        "    # Not this copy's service; leave it running."
+    };
+    let registration = if package.kind == ClaudeTargetKind::Appx {
+        format!(
+            r#"$registered=@(Get-AppxPackage -User $callerSid -Name Claude -ErrorAction Stop | Where-Object {{ $_.PackageFullName -eq {full} -and $_.InstallLocation -eq {root} }})
+if ($registered.Count -ne 1) {{ throw '提权后无法确认原调用用户的 Claude Appx 包。' }}"#,
+            full = ps_quote(&package.package_full_name),
+            root = ps_path(&package.root())
+        )
+    } else {
+        format!(
+            "if (-not (Test-Path -LiteralPath {})) {{ throw '便携版 Claude 可执行文件不存在。' }}",
+            ps_path(&package.exe())
+        )
+    };
     format!(
         r#"$ErrorActionPreference='Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
@@ -327,8 +430,7 @@ $target={path}
 $callerSid={sid}
 $session={session}
 {PROCESS_CIM_METHOD}
-$registered=@(Get-AppxPackage -User $callerSid -Name Claude -ErrorAction Stop | Where-Object {{ $_.PackageFullName -eq {full} -and $_.InstallLocation -eq {root} }})
-if ($registered.Count -ne 1) {{ throw '提权后无法确认原调用用户的 Claude Appx 包。' }}
+{registration}
 if (-not ('ClaudeDesktopJob' -as [type])) {{
     Add-Type -TypeDefinition @'
 {job_helper}
@@ -347,21 +449,23 @@ function Get-TargetClaudeProcesses {{
 $service=Get-CimInstance Win32_Service -Filter "Name='CoworkVMService'" -ErrorAction Stop
 if ($service -and $service.State -ne 'Stopped') {{
     $servicePath=$service.PathName.Trim().Trim('"')
-    if ($servicePath -ne {service_path}) {{ throw 'CoworkVMService 不属于当前 Claude 包，已停止操作。' }}
-    Write-Output '停止当前官方包的 CoworkVMService'
-    Stop-Service -Name CoworkVMService -ErrorAction Stop
-    $deadline=[DateTime]::UtcNow.AddSeconds(15)
-    do {{
-        $service=Get-CimInstance Win32_Service -Filter "Name='CoworkVMService'" -ErrorAction Stop
-        if (-not $service -or $service.State -eq 'Stopped') {{ break }}
-        if ([DateTime]::UtcNow -ge $deadline) {{ throw '等待 CoworkVMService 停止超时。' }}
-        Start-Sleep -Milliseconds 250
-    }} while ($true)
+    if ($servicePath -eq {service_path}) {{
+        Write-Output '停止当前包的 CoworkVMService'
+        Stop-Service -Name CoworkVMService -ErrorAction Stop
+        $deadline=[DateTime]::UtcNow.AddSeconds(15)
+        do {{
+            $service=Get-CimInstance Win32_Service -Filter "Name='CoworkVMService'" -ErrorAction Stop
+            if (-not $service -or $service.State -eq 'Stopped') {{ break }}
+            if ([DateTime]::UtcNow -ge $deadline) {{ throw '等待 CoworkVMService 停止超时。' }}
+            Start-Sleep -Milliseconds 250
+        }} while ($true)
+    }}
+{cowork_foreign}
 }}
 Write-Output '结束当前用户、当前会话的官方 Claude Desktop 进程'
 # Close package-job descendants first, including orphans without package identity.
 # Keep the exact-executable fallback for Desktop versions without a container job.
-[ClaudeDesktopJob]::Close({full}, $callerSid, [uint32]$session)
+{job_close}
 foreach ($item in @(Get-TargetClaudeProcesses)) {{
     # Refresh each CIM instance to avoid acting on an exited/reused process ID.
     $current=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $item.ProcessId) -ErrorAction Stop
@@ -389,30 +493,64 @@ throw ('Claude Desktop 仍在运行，进程 ID：' + (($remaining | ForEach-Obj
 "#,
         path = ps_path(&package.exe()),
         sid = ps_quote(sid),
-        full = ps_quote(&package.package_full_name),
-        root = ps_path(&package.root()),
+        registration = registration,
+        job_close = job_close,
         service_path = ps_path(&package.resources().join("cowork-svc.exe")),
+        cowork_foreign = cowork_foreign,
     )
 }
+
+/// The stable mirror tags every release with its desktop version, so the same
+/// version resolves to a byte-identical, Anthropic-signed MSIX when
+/// downloads.claude.ai is unreachable.
+const MIRROR_ORIGIN: &str = "https://github.com/Wangnov/claude-app-mirror/releases/download/";
+const MIRROR_RELEASE_URL: &str = "https://github.com/Wangnov/claude-app-mirror/releases/download/claude-app-v{version}/Claude-win-x64.msix";
 
 struct MsixMetadata {
     version: String,
     url: String,
 }
 
+impl MsixMetadata {
+    /// Download candidates in order: the official CDN first, then the mirror.
+    fn download_urls(&self) -> [String; 2] {
+        let mirror = MIRROR_RELEASE_URL.replace("{version}", &self.version);
+        [self.url.clone(), mirror]
+    }
+}
+
+/// Both feeds answer with a redirect to the same versioned download URL. The
+/// updates host is tried first because api.anthropic.com is often blocked.
 fn official_metadata() -> Result<MsixMetadata, String> {
+    let mut errors = Vec::new();
+    for source in [MSIX_UPDATES_URL, MSIX_URL] {
+        match metadata_from(source) {
+            Ok(metadata) => return Ok(metadata),
+            Err(error) => errors.push(format!("{source} -> {error}")),
+        }
+    }
+    Err(format!("官方 MSIX 接口不可用：{}", errors.join("；")))
+}
+
+fn metadata_from(source: &str) -> Result<MsixMetadata, String> {
     let script = format!(
-        "$request=[System.Net.HttpWebRequest]::Create({}); $request.AllowAutoRedirect=$false; $request.Timeout=60000; try {{ $response=$request.GetResponse() }} catch [System.Net.WebException] {{ $response=$_.Exception.Response; if (-not $response) {{ throw }} }}; try {{ if ([int]$response.StatusCode -lt 300 -or [int]$response.StatusCode -ge 400) {{ throw ('官方 MSIX 接口返回 HTTP ' + [int]$response.StatusCode) }}; $response.Headers['Location'] }} finally {{ $response.Close() }}",
-        ps_quote(MSIX_URL)
+        "$request=[System.Net.HttpWebRequest]::Create({}); $request.AllowAutoRedirect=$false; $request.Timeout=60000; try {{ $response=$request.GetResponse() }} catch [System.Net.WebException] {{ $response=$_.Exception.Response; if (-not $response) {{ throw }} }}; try {{ if ([int]$response.StatusCode -lt 300 -or [int]$response.StatusCode -ge 400) {{ throw ('MSIX 接口返回 HTTP ' + [int]$response.StatusCode) }}; $response.Headers['Location'] }} finally {{ $response.Close() }}",
+        ps_quote(source)
     );
     let url = util::powershell(&script)?;
-    let url = if url.starts_with('/') {
-        format!("https://downloads.claude.ai{url}")
+    parse_redirect(&url)
+}
+
+/// A relative Location is served from the CDN; either form must name a version
+/// under the official win32/x64 release path.
+fn parse_redirect(location: &str) -> Result<MsixMetadata, String> {
+    let url = if location.starts_with('/') {
+        format!("https://downloads.claude.ai{location}")
     } else {
-        url
+        location.to_string()
     };
     if !url.starts_with("https://downloads.claude.ai/") {
-        return Err("官方 MSIX 跳转地址不符合预期。".into());
+        return Err("MSIX 跳转地址不符合预期。".into());
     }
     let version = url
         .split_once("/releases/win32/x64/")
@@ -495,6 +633,7 @@ pub fn install(operation: &OperationState, only_update: bool) -> Result<Operatio
     let download_dir = data.join(MSIX_DIR);
     fs::create_dir_all(&download_dir).map_err(|error| error.to_string())?;
     let msix = download_dir.join(format!("{MSIX_PREFIX}{}{MSIX_SUFFIX}", metadata.version));
+    let mut download_source = None;
     let reuse = if msix.is_file() {
         operation.step("校验已下载的官方 MSIX 缓存");
         match util::powershell(&cached_msix_check_script(&msix, &metadata.version)) {
@@ -514,7 +653,25 @@ pub fn install(operation: &OperationState, only_update: bool) -> Result<Operatio
     if !reuse {
         operation.step("下载官方 x64 MSIX");
         operation.set_cancelable(true);
-        download_msix(&metadata.url, &msix, operation)?;
+        let urls = metadata.download_urls();
+        let mut errors = Vec::new();
+        let mut source = None;
+        for url in &urls {
+            match download_msix(url, &msix, operation) {
+                Ok(()) => {
+                    source = Some(url.clone());
+                    break;
+                }
+                Err(error) => {
+                    operation.log(format!("{url} 下载失败：{error}"));
+                    errors.push(error);
+                }
+            }
+        }
+        if source.is_none() {
+            return Err(format!("所有下载源均失败：{}", errors.join("；")));
+        }
+        download_source = source;
     }
     // Only the target version can still be installed; older packages just take space.
     for error in util::prune_versioned_downloads(
@@ -530,11 +687,12 @@ pub fn install(operation: &OperationState, only_update: bool) -> Result<Operatio
     operation.log(format!(
         "官方版本：{}；来源：{}；SHA256：{}",
         metadata.version,
-        metadata
-            .url
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(&metadata.url),
+        if reuse {
+            "本地缓存".to_string()
+        } else {
+            let url = download_source.as_deref().unwrap_or(&metadata.url);
+            url.split(['?', '#']).next().unwrap_or(url).to_string()
+        },
         util::sha256(&msix)?
     ));
     // PowerShell can report UnknownError for an MSIX container. Appx registration validates the
@@ -546,33 +704,38 @@ pub fn install(operation: &OperationState, only_update: bool) -> Result<Operatio
     operation.log(format!(
         "MSIX Authenticode 预检查：{signature}；Appx 注册负责校验包签名，安装后会复核 Claude.exe 发布者。"
     ));
+    // A portable copy is upgraded by swapping its files in place and
+    // re-registering the same loose folder: Windows refuses a packaged MSIX over
+    // an unpackaged registration with 0x80073CFB.
+    let portable = current
+        .as_ref()
+        .filter(|package| package.kind == ClaudeTargetKind::Portable)
+        .cloned();
+    let staged = match portable {
+        Some(ref package) => Some(crate::portable::StagedUpdate::stage(
+            &package.root(),
+            &msix,
+            &metadata.version,
+            operation,
+        )?),
+        None => None,
+    };
     let restore_service = if let Some(ref package) = current {
         operation.step("关闭当前官方 Claude Desktop");
         close_desktop_for_update(package, operation)?
     } else {
         false
     };
-    let result = (|| {
-        operation.step("注册官方 Claude Desktop Appx");
-        let script = msix_install_command(&msix);
-        if let Err(error) = util::powershell(&script) {
-            operation.log(format!("Add-AppxPackage 完整错误：{error}"));
-            return Err(appx_install_error_summary(&error).into());
+    let result = match (&portable, &staged) {
+        (Some(package), Some(staged)) => {
+            install_portable_update(package, staged, &metadata.version, operation)
         }
-        operation.step("等待当前用户的 Claude Appx 注册完成");
-        let package = wait_for_installed_version(&metadata.version, query_package, || {
-            std::thread::sleep(Duration::from_secs(1));
-        })?;
-        operation.step("核查当前用户的应用注册");
-        verify_registration(&package)?;
-        operation.step("校验新安装的官方 Claude.exe 签名");
-        verify_official_executable(&package)?;
-        Ok(OperationOutcome::done(format!(
-            "Claude Desktop {} 已安装并通过注册检查。",
-            package.version
-        )))
-    })();
+        _ => install_appx_update(&msix, &metadata.version, operation),
+    };
     if let Err(error) = result {
+        if let Some(ref staged) = staged {
+            staged.discard().iter().for_each(|line| operation.log(line));
+        }
         if restore_service {
             if let Some(ref package) = current {
                 if let Err(restore_error) = restore_desktop_service(package, operation) {
@@ -582,7 +745,104 @@ pub fn install(operation: &OperationState, only_update: bool) -> Result<Operatio
         }
         return Err(error);
     }
+    // The replacement is committed now; only the staging directories remain.
+    if let Some(staged) = staged {
+        staged.finish().iter().for_each(|line| operation.log(line));
+    }
     result
+}
+
+/// The upgrade path for a loose (portable) copy: swap the files, then register
+/// the same folder again so the Appx metadata and Cowork service follow.
+fn install_portable_update(
+    package: &ClaudePackage,
+    staged: &crate::portable::StagedUpdate,
+    version: &str,
+    operation: &OperationState,
+) -> Result<OperationOutcome, String> {
+    let root = package.root();
+    operation.step("替换便携版 Claude 文件");
+    // The record still describes the old files while the rollback below needs to
+    // exist, so it is written only once the new release is in place for good.
+    let mut record = crate::portable::record()?.ok_or("便携安装记录缺失，请重新安装便携版。")?;
+    staged.swap()?;
+    let result: Result<OperationOutcome, String> = (|| {
+        crate::portable::write_launcher(&root)?;
+        let family = if crate::portable::is_registered(&root)? {
+            operation.step("重新注册 AppX 与 Cowork 服务");
+            let family = crate::portable::register_appx(&root, staged.identity(), operation)?;
+            operation.step("等待当前用户的 Claude Appx 注册完成");
+            // The registered version is the one Windows reports for this folder;
+            // the assistant's record still names the release being replaced.
+            wait_for_installed_version(
+                version,
+                || {
+                    Ok(
+                        crate::portable::registered_version(&root)?.map(|version| ClaudePackage {
+                            package_full_name: String::new(),
+                            package_family_name: String::new(),
+                            version,
+                            architecture: "X64".into(),
+                            install_location: root.display().to_string(),
+                            kind: ClaudeTargetKind::Portable,
+                        }),
+                    )
+                },
+                || std::thread::sleep(Duration::from_secs(1)),
+            )?;
+            family
+        } else {
+            operation.log("该便携版未注册 AppX，只替换文件");
+            String::new()
+        };
+        crate::portable::apply_update(&mut record, version, &family);
+        crate::portable::save_record(&record)?;
+        Ok(OperationOutcome::done(format!(
+            "Claude Desktop {version} 已更新到 {}。",
+            root.display()
+        )))
+    })();
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            operation.log("升级未完成，正在回滚到更新前的文件");
+            staged
+                .restore()
+                .map_err(|rollback| format!("{error}；回滚也失败：{rollback}"))?;
+            // Registration survives a rollback, so it has to be put back too.
+            if let Err(restore) = crate::portable::restore_registration(&root, operation) {
+                return Err(format!(
+                    "{error}；已回滚文件，但还原 AppX 注册失败：{restore}"
+                ));
+            }
+            Err(format!("{error}；已回滚到更新前的版本。"))
+        }
+    }
+}
+
+fn install_appx_update(
+    msix: &Path,
+    version: &str,
+    operation: &OperationState,
+) -> Result<OperationOutcome, String> {
+    operation.step("注册官方 Claude Desktop Appx");
+    let script = msix_install_command(msix);
+    if let Err(error) = util::powershell(&script) {
+        operation.log(format!("Add-AppxPackage 完整错误：{error}"));
+        return Err(appx_install_error_summary(&error).into());
+    }
+    operation.step("等待当前用户的 Claude Appx 注册完成");
+    let package = wait_for_installed_version(version, query_package, || {
+        std::thread::sleep(Duration::from_secs(1));
+    })?;
+    operation.step("核查当前用户的应用注册");
+    verify_registration(&package)?;
+    operation.step("校验新安装的官方 Claude.exe 签名");
+    verify_official_executable(&package)?;
+    Ok(OperationOutcome::done(format!(
+        "Claude Desktop {} 已安装并通过注册检查。",
+        package.version
+    )))
 }
 
 fn appx_install_error_summary(error: &str) -> &'static str {
@@ -630,7 +890,7 @@ try {{
 }
 
 fn download_msix(url: &str, destination: &Path, operation: &OperationState) -> Result<(), String> {
-    if !url.starts_with("https://downloads.claude.ai/") {
+    if !url.starts_with("https://downloads.claude.ai/") && !url.starts_with(MIRROR_ORIGIN) {
         return Err("官方 MSIX 下载地址不符合预期。".into());
     }
     operation.log("建立官方下载连接");
@@ -773,6 +1033,15 @@ $url=$null -ne $key -and $null -ne $key.GetValue('URL Protocol', $null)
 }
 
 fn verify_registration(package: &ClaudePackage) -> Result<(), String> {
+    // A portable copy needs no Appx registration; only its files matter.
+    if package.kind == ClaudeTargetKind::Portable {
+        for path in [package.exe(), package.root().join("Claude.cmd")] {
+            if !path.is_file() {
+                return Err(format!("便携版 Claude 文件缺失：{}", path.display()));
+            }
+        }
+        return Ok(());
+    }
     let manifest = package.root().join("AppxManifest.xml");
     let check = registration_check_script(&manifest);
     if !util::powershell(&check)?.eq_ignore_ascii_case("true") {
@@ -793,15 +1062,15 @@ fn verify_registration(package: &ClaudePackage) -> Result<(), String> {
 // Existing full localization intentionally changes Claude.exe's ASAR integrity
 // field. Registration checks must remain usable for that package; signature
 // validation belongs to the newly downloaded official installation only.
-fn official_executable_check_script(package: &ClaudePackage) -> String {
+pub(crate) fn official_executable_check_script(exe: &Path) -> String {
     format!(
         "$sig=Get-AuthenticodeSignature -FilePath {}; if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Anthropic') {{ throw ('官方 Claude.exe 签名校验失败：' + $sig.Status) }}; 'Valid Anthropic'",
-        ps_path(&package.exe())
+        ps_path(exe)
     )
 }
 
 fn verify_official_executable(package: &ClaudePackage) -> Result<(), String> {
-    let signature = util::powershell(&official_executable_check_script(package))?;
+    let signature = util::powershell(&official_executable_check_script(&package.exe()))?;
     if signature != "Valid Anthropic" {
         return Err("官方程序签名结果无法确认。".into());
     }
@@ -1061,6 +1330,7 @@ mod tests {
             package_family_name: FAMILY.into(),
             version: "1.0.0.0".into(),
             architecture: "X64".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: root.to_string_lossy().into(),
         };
         // The same path forms as production: create_shortcut stores
@@ -1112,6 +1382,7 @@ mod tests {
             package_family_name: FAMILY.into(),
             version: "1.0.0.0".into(),
             architecture: "X64".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: root.to_string_lossy().into(),
         };
         let icon = root.join("cache/claude-desktop.ico");
@@ -1200,6 +1471,7 @@ mod tests {
             package_family_name: FAMILY.into(),
             version: String::new(),
             architecture: "X64".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: r"C:\fixture\Claude".into(),
         };
         let probe = desktop_running_script(&package);
@@ -1247,6 +1519,7 @@ function Invoke-CimMethod {{ [pscustomobject]@{{ReturnValue=0;Sid={owner}}} }}
             package_family_name: FAMILY.into(),
             version: "2.1.0.0".into(),
             architecture: "X64".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: r"C:\Program Files\WindowsApps\Claude_2.1.0.0_x64__other".into(),
         };
         assert!(validate_package(&package).is_err());
@@ -1268,6 +1541,7 @@ function Invoke-CimMethod {{ [pscustomobject]@{{ReturnValue=0;Sid={owner}}} }}
             package_family_name: FAMILY.into(),
             version: "0.0.0.0".into(),
             architecture: "X64".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: format!(r"C:\fixture\{full}"),
         };
         let closing = close_desktop_script(&package, &sid, session);
@@ -1313,6 +1587,7 @@ $legacyCloseFixture={{ {legacy_closing} }}
             package_family_name: FAMILY.into(),
             version: "2.1.0.0".into(),
             architecture: "X64".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: r"C:\Program Files\WindowsApps\Claude_2.1.0.0_x64__pzs8sxrjxfjjc"
                 .into(),
         };
@@ -1385,6 +1660,27 @@ if (@($global:processes | Where-Object {{ $_.ProcessId -in @(102,103,104) }}).Co
     }
 
     #[test]
+    fn portable_close_ignores_another_installations_cowork_service() {
+        let mut package = ClaudePackage {
+            package_full_name: String::new(),
+            version: "1".into(),
+            kind: ClaudeTargetKind::Portable,
+            install_location: r"C:\Portable".into(),
+            package_family_name: String::new(),
+            architecture: "X64".into(),
+        };
+        let portable = close_desktop_script(&package, "S-1-5-21-1", 8);
+        assert!(!portable.contains("CoworkVMService 不属于当前 Claude 包"));
+        assert!(!portable.contains("[ClaudeDesktopJob]::Close"));
+        assert!(portable.contains("Not this copy's service"));
+
+        package.kind = ClaudeTargetKind::Appx;
+        let appx = close_desktop_script(&package, "S-1-5-21-1", 8);
+        assert!(appx.contains("CoworkVMService 不属于当前 Claude 包"));
+        assert!(appx.contains("[ClaudeDesktopJob]::Close"));
+    }
+
+    #[test]
     fn process_exit_race_accepts_only_confirmed_not_found() {
         let script = format!(
             r#"
@@ -1445,6 +1741,7 @@ foreach ($method in @('GetOwnerSid','Terminate')) {{
                     version: if attempts == 2 { "1.0.0" } else { "2.0.0.0" }.into(),
                     architecture: "X64".into(),
                     install_location: String::new(),
+                    kind: ClaudeTargetKind::Appx,
                 }))
             },
             || pauses += 1,
@@ -1468,14 +1765,8 @@ foreach ($method in @('GetOwnerSid','Terminate')) {{
 
     #[test]
     fn newly_installed_executable_requires_valid_anthropic_signature() {
-        let package = ClaudePackage {
-            package_full_name: String::new(),
-            package_family_name: FAMILY.into(),
-            version: String::new(),
-            architecture: "X64".into(),
-            install_location: r"C:\fixture\Claude".into(),
-        };
-        let check = official_executable_check_script(&package);
+        let check =
+            official_executable_check_script(Path::new(r"C:\fixture\Claude\app\Claude.exe"));
         for (status, publisher, valid) in [
             ("Valid", "CN=Anthropic", true),
             ("HashMismatch", "CN=Anthropic", false),
@@ -1542,6 +1833,71 @@ function Get-Item {{
     fn msix_install_reuses_package_shutdown_flags_without_changing_user() {
         let script = msix_install_command(Path::new(r"C:\cache\Claude's app.msix"));
         assert_eq!(script, "Add-AppxPackage -Path 'C:\\cache\\Claude''s app.msix' -ForceApplicationShutdown -ForceUpdateFromAnyVersion -ErrorAction Stop");
+    }
+
+    #[test]
+    fn downloads_try_the_official_cdn_before_the_mirror() {
+        let metadata = MsixMetadata {
+            version: "4.4212.0".into(),
+            url: "https://downloads.claude.ai/releases/win32/x64/4.4212.0/Claude-abc.msix".into(),
+        };
+        let [official, mirror] = metadata.download_urls();
+        assert!(official.starts_with("https://downloads.claude.ai/"));
+        assert_eq!(
+            mirror,
+            "https://github.com/Wangnov/claude-app-mirror/releases/download/claude-app-v4.4212.0/Claude-win-x64.msix"
+        );
+        // The version must come from the resolved feed, not a hard-coded release.
+        let other = MsixMetadata {
+            version: "4.5000.0".into(),
+            url: "https://downloads.claude.ai/releases/win32/x64/4.5000.0/Claude-def.msix".into(),
+        };
+        assert!(other.download_urls()[1].contains("claude-app-v4.5000.0/"));
+    }
+
+    #[test]
+    fn download_accepts_only_verified_hosts() {
+        for (url, allowed) in [
+            ("https://downloads.claude.ai/releases/win32/x64/4.4212.0/Claude-abc.msix", true),
+            ("https://github.com/Wangnov/claude-app-mirror/releases/download/claude-app-v4.4212.0/Claude-win-x64.msix", true),
+            ("https://evil.example.com/Claude-win-x64.msix", false),
+            ("https://github.com.evil.example/Wangnov/claude-app-mirror/releases/download/x.msix", false),
+            ("http://github.com/Wangnov/claude-app-mirror/releases/download/x.msix", false),
+        ] {
+            let accepted = url.starts_with("https://downloads.claude.ai/") || url.starts_with(MIRROR_ORIGIN);
+            assert_eq!(accepted, allowed, "{url}");
+        }
+    }
+
+    #[test]
+    fn metadata_falls_back_to_the_updates_host_when_anthropic_is_blocked() {
+        // 403 from api.anthropic.com must not abort the check: the loop reaches
+        // releases.claude.com, whose redirect the resolver already accepts.
+        assert_ne!(MSIX_UPDATES_URL, MSIX_URL);
+        assert!(MSIX_UPDATES_URL.starts_with("https://releases.claude.com/"));
+    }
+
+    #[test]
+    fn redirect_parsing_extracts_the_version_and_rejects_foreign_hosts() {
+        for (location, version) in [
+            (
+                "https://downloads.claude.ai/releases/win32/x64/4.4212.0/Claude-cbfe3c56.msix",
+                "4.4212.0",
+            ),
+            ("/releases/win32/x64/4.29.0/Claude-abc.msix", "4.29.0"),
+        ] {
+            let metadata = parse_redirect(location).unwrap();
+            assert_eq!(metadata.version, version);
+            assert!(metadata.url.starts_with("https://downloads.claude.ai/"));
+        }
+        for location in [
+            "https://evil.example.com/releases/win32/x64/4.4212.0/Claude.msix",
+            "https://downloads.claude.ai/releases/win32/x64/latest/Claude.msix",
+            "https://github.com/Wangnov/claude-app-mirror/releases/download/x.msix",
+            "",
+        ] {
+            assert!(parse_redirect(location).is_err(), "{location}");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::engine_cache::{self, download_engine};
 use crate::{
-    claude::{self, ClaudePackage},
+    claude::{self, ClaudePackage, ClaudeTargetKind},
     operation::{OperationOutcome, OperationState},
     util::{self, ps_path, ps_quote},
 };
@@ -16,6 +16,176 @@ const ENGINE_URL: &str =
 const ENGINE_DOWNLOAD_URL: &str =
     "https://codeload.github.com/javaht/claude-desktop-zh-cn/zip/refs/heads/main";
 pub(crate) const ENGINE_DIR: &str = "patch-engine";
+
+// Injected into the engine: writes the staged style sheet and font files into
+// the archive workspace, and inserts the <link> that loads it. Runs inside the
+// engine's extract/repack window, so the asar is written once per operation.
+const FONT_PATCH_FUNCTION: &str = r#"
+function Invoke-ClaudeCnFontPatch {
+    param(
+        [string]$ResourcesPath,
+        [string]$StagePath
+    )
+
+    if (-not (Test-Path -LiteralPath $StagePath -PathType Container)) {
+        throw "字体工作目录缺失: $StagePath"
+    }
+
+    if (Test-Path -LiteralPath (Join-Path $ResourcesPath 'ion-dist.asar')) {
+        $workspace = Join-Path $ResourcesPath 'ion-dist'
+        if (-not (Test-Path -LiteralPath $workspace -PathType Container)) {
+            throw "字体补丁必须在 ion-dist.asar 解包之后执行: $workspace"
+        }
+    }
+    else {
+        $workspace = Join-Path $ResourcesPath 'ion-dist'
+    }
+
+    $assetsDir = Join-Path $workspace 'assets\v1'
+    if (-not (Test-Path -LiteralPath $assetsDir -PathType Container)) {
+        throw "未找到前端资源目录: $assetsDir"
+    }
+
+    $cssSource = Join-Path $StagePath 'claude-cn-font.css'
+    $cssName = 'claude-cn-font.css'
+    $cssTarget = Join-Path $assetsDir $cssName
+    $fontTargetDir = Join-Path $assetsDir 'fonts'
+    $marker = 'data-claude-cn-font='
+
+    $stylePattern = [System.Text.RegularExpressions.Regex]::new(
+        '<link[^>]*' + [System.Text.RegularExpressions.Regex]::Escape($marker) + '[^>]*>',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+
+    foreach ($page in @('index.html', 'frame-shell.html', 'client-shell-v1.html', 'frame-connect.html', 'frame-manage.html')) {
+        $pagePath = Join-Path $workspace $page
+        if (-not (Test-Path -LiteralPath $pagePath -PathType Leaf)) {
+            continue
+        }
+        $text = [System.IO.File]::ReadAllText($pagePath, [System.Text.Encoding]::UTF8)
+        $stripped = $stylePattern.Replace($text, '')
+        if (-not (Test-Path -LiteralPath $cssSource -PathType Leaf)) {
+            if ($stripped -ne $text) {
+                [System.IO.File]::WriteAllText($pagePath, $stripped, $Utf8NoBom)
+                Write-Host "  removed font stylesheet link from $page" -ForegroundColor DarkGray
+            }
+            continue
+        }
+        $link = '<link rel="stylesheet" href="/assets/v1/' + $cssName + '" data-claude-cn-font="1">'
+        if ($stripped -match '</head>') {
+            $updated = [System.Text.RegularExpressions.Regex]::Replace($stripped, '</head>', ($link + '</head>'), 1)
+        }
+        else {
+            continue
+        }
+        if ($updated -ne $text) {
+            [System.IO.File]::WriteAllText($pagePath, $updated, $Utf8NoBom)
+            Write-Host "  linked font stylesheet in $page" -ForegroundColor DarkGray
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $cssSource -PathType Leaf)) {
+        Remove-Item -LiteralPath $cssTarget -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $fontTargetDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "  fonts reset to Claude defaults" -ForegroundColor Green
+        return
+    }
+
+    Copy-Item -LiteralPath $cssSource -Destination $cssTarget -Force
+    $stagedFonts = Join-Path $StagePath 'fonts'
+    if (Test-Path -LiteralPath $stagedFonts -PathType Container) {
+        New-Item -ItemType Directory -Path $fontTargetDir -Force | Out-Null
+        Get-ChildItem -LiteralPath $stagedFonts -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $fontTargetDir $_.Name) -Force
+        }
+    }
+    # Drop published font files the current settings no longer reference.
+    if (Test-Path -LiteralPath $fontTargetDir -PathType Container) {
+        $keep = @(Get-ChildItem -LiteralPath $stagedFonts -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        Get-ChildItem -LiteralPath $fontTargetDir -File | Where-Object { $keep -notcontains $_.Name } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Host "  wrote font stylesheet and font files" -ForegroundColor Green
+}
+"#;
+
+// Font-only action: one extract/repack pass over the frontend archive, with no
+// language resources touched.
+const FONT_ONLY_FUNCTION: &str = r#"
+function Invoke-ClaudeCnFontOnly {
+    Stop-ClaudeProcesses
+    $paths=Get-ClaudeResourcesPath
+    $resourcesPath=$paths['Resources']
+    $target=Initialize-FrontendPatchTarget $resourcesPath
+    try {
+        Invoke-ClaudeCnFontPatch -ResourcesPath $resourcesPath -StagePath $env:CLAUDE_CN_FONT_STAGE
+        Complete-FrontendPatchTarget $target
+    }
+    finally {
+        Close-FrontendPatchTarget $target
+    }
+}
+"#;
+
+/// Inserts the font functions before the engine's dispatcher. PowerShell
+/// resolves a function when the calling statement runs, so a definition placed
+/// after `switch ($Action)` would be too late.
+fn insert_before_dispatcher(content: &str, definitions: &[&str]) -> Result<String, String> {
+    let offset = ["\r\n", "\n"]
+        .iter()
+        .find_map(|newline| {
+            let header = format!("switch ($Action) {{{newline}");
+            content.find(&header).map(|index| (index, *newline))
+        })
+        .ok_or("最新引擎的 Action 分支结构已变化。")?;
+    // Insert on its own line(s) at the dispatcher's line start.
+    let line_start = content[..offset.0]
+        .rfind(offset.1)
+        .map(|index| index + offset.1.len())
+        .ok_or("最新引擎的 Action 分支结构已变化。")?;
+    let block = definitions
+        .iter()
+        .map(|definition| definition.trim_matches('\n'))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut result = content.to_string();
+    result.insert_str(line_start, &format!("{block}{}", offset.1));
+    Ok(result)
+}
+
+/// Registers the `font` action in the engine's parameter set and dispatcher.
+fn add_font_action(content: &str) -> Result<String, String> {
+    // The engine declares the action set either as a ValidateSet list or as a
+    // plain switch; only a missing dispatcher is fatal, so both engines adapt.
+    let actions = r#""install", "uninstall", "disable-updates", "enable-updates", "sync-skills", "unsync-skills""#;
+    let with_font = r#""install", "uninstall", "font", "disable-updates", "enable-updates", "sync-skills", "unsync-skills""#;
+    let content = content.replace(actions, with_font);
+    for newline in ["\r\n", "\n"] {
+        let header = format!("switch ($Action) {{{newline}");
+        let Some(start) = content.find(&header) else {
+            continue;
+        };
+        // Follow the indentation of the first existing branch so the inserted
+        // line matches whichever engine wrote the file.
+        let after = start + header.len();
+        let install = content[after..]
+            .find("\"install\" {")
+            .ok_or("最新引擎的 Action 分支结构已变化。")?;
+        let line_start = content[..after + install]
+            .rfind(newline)
+            .map(|index| index + newline.len())
+            .unwrap_or(after);
+        let indent = &content[line_start..after + install];
+        if !indent.trim().is_empty() {
+            return Err("最新引擎的 Action 分支缩进无法识别。".into());
+        }
+        let inserted = format!("{indent}\"font\" {{ Invoke-ClaudeCnFontOnly }}{newline}");
+        let mut result = content.clone();
+        result.insert_str(line_start, &inserted);
+        return Ok(result);
+    }
+    Err("最新引擎的 Action 分支结构已变化。".into())
+}
 
 // Reused from claude-desktop-zh: retain its bundle batching and effort-label adaptation.
 const FAST_HARDCODED_FRONTEND_PATCH_FUNCTION: &str = r#"
@@ -258,12 +428,7 @@ pub fn state(package: &ClaudePackage) -> Result<PatchState, String> {
         });
     }
     let valid = validate_backup(&manifest, package).is_ok();
-    let localized = package
-        .resources()
-        .join("ion-dist")
-        .join("i18n")
-        .join("zh-CN.json")
-        .is_file();
+    let localized = has_language_file(&package.resources(), "zh-CN");
     Ok(PatchState {
         applied_mode: if localized && !recovery_required {
             manifest.applied_mode
@@ -277,18 +442,34 @@ pub fn state(package: &ClaudePackage) -> Result<PatchState, String> {
     })
 }
 
+/// Whether one language file is installed, either unpacked or inside the
+/// frontend archive. 4.x packs the frontend into `ion-dist.asar`, and the engine
+/// deletes its extract workspace after repacking, so the archive is the only
+/// place a successful install can leave the file.
+fn has_language_file(resources: &Path, language: &str) -> bool {
+    resources
+        .join("ion-dist")
+        .join("i18n")
+        .join(format!("{language}.json"))
+        .is_file()
+        || resources.join(format!("{language}.json")).is_file()
+        || crate::fonts::asar_contains(
+            &resources.join("ion-dist.asar"),
+            &format!("i18n/{language}.json"),
+        )
+        || crate::fonts::asar_contains(
+            &resources.join("ion-dist.asar"),
+            &format!("{language}.json"),
+        )
+}
+
+/// Whether the installed frontend already carries Chinese resources from
+/// another tool. A `.zh-cn-backups` folder alone is not evidence: the font patch
+/// uses the engine's backup helper and leaves one behind on a clean install.
 fn has_localization_assets(resources: &Path) -> bool {
-    if resources.join(".zh-cn-backups").exists() {
-        return true;
-    }
-    ["zh-CN", "zh-TW", "zh-HK"].iter().any(|language| {
-        resources
-            .join("ion-dist")
-            .join("i18n")
-            .join(format!("{language}.json"))
-            .exists()
-            || resources.join(format!("{language}.json")).exists()
-    })
+    ["zh-CN", "zh-TW", "zh-HK"]
+        .iter()
+        .any(|language| has_language_file(resources, language))
 }
 
 fn validate_backup(manifest: &BackupManifest, package: &ClaudePackage) -> Result<PathBuf, String> {
@@ -533,11 +714,13 @@ fn apply_with_engine(
     let result = (|| {
         if let Some(mut manifest) = existing {
             operation.step("按当前版本备份恢复原始文件");
-            run_engine(engine, &script, package, "uninstall", None, operation)?;
+            run_engine(engine, &script, package, "uninstall", None, None, operation)?;
             verify_restored(&manifest, package)?;
             manifest.applied_mode = None;
             save_manifest(&manifest)?;
         }
+        // Localization and fonts share one archive extract/repack pass.
+        let font_stage = crate::fonts::stage_for_apply();
         operation.step("应用简体中文资源");
         run_engine(
             engine,
@@ -545,6 +728,7 @@ fn apply_with_engine(
             package,
             "install",
             pending.as_ref(),
+            font_stage.as_deref(),
             operation,
         )?;
         let set = unique_backup_set(&backup_root)?;
@@ -552,13 +736,7 @@ fn apply_with_engine(
         if files.is_empty() {
             return Err("补丁操作完成，但没有可验证的原始文件备份。".into());
         }
-        if !package
-            .resources()
-            .join("ion-dist")
-            .join("i18n")
-            .join("zh-CN.json")
-            .is_file()
-        {
+        if !has_language_file(&package.resources(), "zh-CN") {
             return Err("脚本退出成功，但未找到简体中文资源。".into());
         }
         let manifest = BackupManifest {
@@ -647,7 +825,7 @@ fn rollback_first_apply(
     };
     validate_backup(&manifest, package)?;
     operation.step("汉化失败，恢复本次备份");
-    run_engine(engine, script, package, "uninstall", None, operation)?;
+    run_engine(engine, script, package, "uninstall", None, None, operation)?;
     verify_restored(&manifest, package)?;
     manifest.applied_mode = None;
     save_manifest(&manifest)?;
@@ -666,7 +844,15 @@ pub fn restore(operation: &OperationState) -> Result<OperationOutcome, String> {
     let result = (|| {
         let script = adapt_engine(&engine, &package)?;
         operation.step("恢复当前 Claude 版本的原始文件");
-        run_engine(&engine, &script, &package, "uninstall", None, operation)?;
+        run_engine(
+            &engine,
+            &script,
+            &package,
+            "uninstall",
+            None,
+            None,
+            operation,
+        )?;
         verify_restored(&manifest, &package)?;
         manifest.applied_mode = None;
         manifest.engine_sha256 = engine.sha256.clone();
@@ -777,6 +963,21 @@ fn adapt_engine(engine: &Engine, package: &ClaudePackage) -> Result<PathBuf, Str
         "Patch-HardcodedFrontendStrings",
         FAST_HARDCODED_FRONTEND_PATCH_FUNCTION,
     )?;
+    // Both functions must exist before the dispatcher runs, so they go in just
+    // ahead of it rather than at the end of the file.
+    content = insert_before_dispatcher(&content, &[FONT_PATCH_FUNCTION, FONT_ONLY_FUNCTION])?;
+    content = add_font_action(&content)?;
+    // The font hook shares the engine's extract/repack window, so localization
+    // and fonts are written in one archive pass. Its call site is tied to the
+    // engine's layout; a moved call must fail loudly instead of dropping fonts.
+    let font_call = "Complete-FrontendPatchTarget $patchTarget";
+    if content.matches(font_call).count() != 1 {
+        return Err("最新引擎的前端重打包调用结构已变化。".into());
+    }
+    content = content.replace(
+        font_call,
+        "if ($env:CLAUDE_CN_FONT_STAGE) { Invoke-ClaudeCnFontPatch -ResourcesPath $resourcesPath -StagePath $env:CLAUDE_CN_FONT_STAGE }\n        Complete-FrontendPatchTarget $patchTarget",
+    );
     let (sid, session) = util::caller_identity()?;
     content = replace_function(
         &content,
@@ -900,6 +1101,7 @@ fn run_engine(
     package: &ClaudePackage,
     action: &str,
     pending: Option<&PendingPatch>,
+    font_stage: Option<&Path>,
     operation: &OperationState,
 ) -> Result<String, String> {
     let work = engine.root.parent().ok_or("引擎工作目录无效。")?;
@@ -910,9 +1112,36 @@ fn run_engine(
         package,
         action,
         pending.map(|p| (p, record_path.as_path())),
+        font_stage,
     )?;
     util::write_script(&wrapper, &script_content)?;
     util::run_elevated_script_with_logs(&wrapper, work, |chunk| operation.log(chunk))
+}
+
+/// Rebuilds the frontend archive with only the font stylesheet changed. The
+/// engine already extracts the archive, repacks it and syncs the Claude.exe
+/// hash, so the font action reuses that path instead of a second implementation.
+pub fn run_font_engine(
+    stage: &Path,
+    package: &ClaudePackage,
+    operation: &OperationState,
+) -> Result<(), String> {
+    let engine = fetch_engine(operation)?;
+    let result = (|| {
+        let script = adapt_engine(&engine, package)?;
+        run_engine(
+            &engine,
+            &script,
+            package,
+            "font",
+            None,
+            Some(stage),
+            operation,
+        )?;
+        Ok(())
+    })();
+    finish_engine_run(&engine, result.is_ok(), operation);
+    result
 }
 
 fn engine_mode_argument(script: &Path) -> Result<String, String> {
@@ -933,6 +1162,7 @@ fn engine_wrapper(
     package: &ClaudePackage,
     action: &str,
     pending: Option<(&PendingPatch, &Path)>,
+    font_stage: Option<&Path>,
 ) -> Result<String, String> {
     let mode_argument = engine_mode_argument(script)?;
     let caller_sid =
@@ -958,18 +1188,32 @@ fn engine_wrapper(
         String::new()
     };
     let expected_root = package.root();
-    let script_content = format!(
-        r#"$ErrorActionPreference='Stop'
-        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
-        $OutputEncoding = [Console]::OutputEncoding
-        $sid={sid}; $expected={expected}; $full={full}; $app=Join-Path $expected 'app'
-        $registered=@(Get-AppxPackage -User $sid -Name Claude -ErrorAction Stop | Where-Object {{ $_.PackageFullName -eq $full -and $_.InstallLocation -eq $expected }})
+    // A portable copy already belongs to the caller, so no package assertion and
+    // no ACL change are needed; the Appx copy is registered under this user and
+    // may sit in WindowsApps, where writing needs the elevated grant.
+    let prepare = if package.kind == ClaudeTargetKind::Portable {
+        format!(
+            "if (-not (Test-Path -LiteralPath (Join-Path {app} 'Claude.exe'))) {{ throw 'Claude 目标文件不存在。' }}",
+            app = ps_path(&expected_root.join("app"))
+        )
+    } else {
+        format!(
+            r#"$registered=@(Get-AppxPackage -User $sid -Name Claude -ErrorAction Stop | Where-Object {{ $_.PackageFullName -eq $full -and $_.InstallLocation -eq $expected }})
         if ($registered.Count -ne 1) {{ throw '提权后无法确认原调用用户的 Claude Appx 包。' }}
         if (-not (Test-Path -LiteralPath (Join-Path $app 'Claude.exe'))) {{ throw 'Claude 目标文件不存在。' }}
         & takeown.exe /F $app /A /R /D Y | Out-Null
         if ($LASTEXITCODE -ne 0) {{ throw '获取 Claude app 写权限失败。' }}
         & icacls.exe $app /grant ('*' + $sid + ':(OI)(CI)M') /T /C /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) {{ throw '设置 Claude app 写权限失败。' }}
+        if ($LASTEXITCODE -ne 0) {{ throw '设置 Claude app 写权限失败。' }}"#
+        )
+    };
+    let script_content = format!(
+        r#"$ErrorActionPreference='Stop'
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+        $OutputEncoding = [Console]::OutputEncoding
+        $sid={sid}; $expected={expected}; $full={full}; $app=Join-Path $expected 'app'
+        $env:CLAUDE_CN_FONT_STAGE={font_stage}
+        {prepare}
         $service=Get-CimInstance Win32_Service -Filter "Name='CoworkVMService'" -ErrorAction Stop
         $restoreCowork=($service -and $service.State -eq 'Running' -and $service.PathName.Trim().Trim('"') -eq {service_path})
         $failure=$null
@@ -990,6 +1234,12 @@ fn engine_wrapper(
         }}
         if ($failure) {{ throw $failure }}
     "#,
+        prepare = prepare,
+        font_stage = ps_quote(
+            font_stage
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
         restore_service = RESTORE_COWORK_SERVICE_FUNCTION,
         service_path = ps_path(&package.resources().join("cowork-svc.exe")),
         sid = ps_quote(caller_sid),
@@ -1036,12 +1286,71 @@ mod tests {
     }
 
     #[test]
+    fn font_patch_writes_and_removes_stylesheet_in_workspace() {
+        let root = env::temp_dir().join(format!("font-patch-{}", std::process::id()));
+        let resources = root.join("Resources");
+        let workspace = resources.join("ion-dist");
+        let stage = root.join("stage");
+        fs::create_dir_all(workspace.join("assets").join("v1")).unwrap();
+        fs::create_dir_all(stage.join("fonts")).unwrap();
+        fs::write(
+            workspace.join("index.html"),
+            "<html><head><title>t</title></head><body></body></html>",
+        )
+        .unwrap();
+        fs::write(
+            stage.join("claude-cn-font.css"),
+            ":root{--font-ui:Demo !important;}",
+        )
+        .unwrap();
+        fs::write(stage.join("fonts").join("demo.woff2"), "font").unwrap();
+
+        let script = root.join("font.ps1");
+        util::write_script(
+            &script,
+            &format!(
+                "$Utf8NoBom = New-Object System.Text.UTF8Encoding $false\n{function}\nInvoke-ClaudeCnFontPatch -ResourcesPath {resources} -StagePath {stage}\nWrite-Output 'applied'",
+                function = FONT_PATCH_FUNCTION,
+                resources = ps_path(&resources),
+                stage = ps_path(&stage),
+            ),
+        )
+        .unwrap();
+        assert!(util::powershell(&format!("& {}", ps_path(&script)))
+            .unwrap()
+            .contains("applied"));
+
+        let page = fs::read_to_string(workspace.join("index.html")).unwrap();
+        assert!(page.contains(r#"data-claude-cn-font="1""#));
+        assert!(page.contains("/assets/v1/claude-cn-font.css"));
+        assert!(workspace.join("assets/v1/claude-cn-font.css").exists());
+        assert!(workspace.join("assets/v1/fonts/demo.woff2").exists());
+
+        // Applying twice must not stack duplicate links.
+        util::powershell(&format!("& {}", ps_path(&script))).unwrap();
+        let page = fs::read_to_string(workspace.join("index.html")).unwrap();
+        assert_eq!(page.matches("data-claude-cn-font").count(), 1);
+
+        // An empty stage means "reset": link, stylesheet and font files go away.
+        fs::remove_file(stage.join("claude-cn-font.css")).unwrap();
+        fs::remove_dir_all(stage.join("fonts")).unwrap();
+        util::powershell(&format!("& {}", ps_path(&script))).unwrap();
+        let page = fs::read_to_string(workspace.join("index.html")).unwrap();
+        assert!(!page.contains("data-claude-cn-font"));
+        assert!(!workspace.join("assets/v1/claude-cn-font.css").exists());
+        assert!(!workspace.join("assets/v1/fonts").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pending_record_starts_only_after_preflight_and_survives_engine_failure() {
         let root = env::temp_dir().join(format!("issue-2-regression-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let package = ClaudePackage {
             package_full_name: "fixture".into(),
             version: "1".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: root.join("package").display().to_string(),
             package_family_name: "fixture".into(),
             architecture: "X64".into(),
@@ -1061,6 +1370,7 @@ mod tests {
             &package,
             "install",
             Some((&pending, &record)),
+            None,
         )
         .unwrap();
         for (stage, expected, recorded) in [
@@ -1214,6 +1524,10 @@ if (-not $rejected -or $script:starts -ne 1) {{ throw 'Foreign service must not 
             fs::read_to_string(path).unwrap()
         } else {
             let mut source = String::from("\u{feff}param([string]$Fixture = 'ok')\n$script:DetectedUnpackagedClaudePaths = @(Get-UnpackagedClaudePaths)\nEnable-WriteAccess $resourcesPath\n");
+            source.push_str("$actions = @(\"install\", \"uninstall\", \"disable-updates\", \"enable-updates\", \"sync-skills\", \"unsync-skills\")\n");
+            // Shaped like the real dispatcher, so the font action insertion is exercised.
+            source.push_str("switch ($Action) {\n    \"install\" { Write-Output 'install' }\n    \"uninstall\" { Write-Output 'uninstall' }\n}\n");
+            source.push_str("function Install-WindowsLanguagePack {\n    $patchTarget = Initialize-FrontendPatchTarget $resourcesPath\n    Complete-FrontendPatchTarget $patchTarget\n}\n");
             for name in [
                 "Find-ClaudePath",
                 "Get-ClaudeConfigPaths",
@@ -1244,12 +1558,13 @@ if (-not $rejected -or $script:starts -ne 1) {{ throw 'Foreign service must not 
             version: "1.0.0.0".into(),
             package_full_name: "Claude_1.0.0.0_x64__pzs8sxrjxfjjc".into(),
             package_family_name: "Claude_pzs8sxrjxfjjc".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: r"C:\Program Files\WindowsApps\Claude_1.0.0.0_x64__pzs8sxrjxfjjc"
                 .into(),
             architecture: "X64".into(),
         };
         let adapted = adapt_engine(&engine, &package).unwrap();
-        let wrapper = engine_wrapper(&adapted, &package, "install", None).unwrap();
+        let wrapper = engine_wrapper(&adapted, &package, "install", None, None).unwrap();
         assert_eq!(
             wrapper.contains("-PatchMode"),
             source.contains("$PatchMode")
@@ -1259,6 +1574,23 @@ if (-not $rejected -or $script:starts -ne 1) {{ throw 'Foreign service must not 
         assert!(output.contains("function Stop-ClaudeProcesses {\n$ErrorActionPreference"));
         assert!(output.contains("GetOwnerSid"));
         assert!(output.contains("__effortLabelReplacementCount"));
+        // PowerShell resolves functions when the statement runs, so the font
+        // definitions must precede the dispatcher that selects them.
+        let dispatcher = output
+            .find("switch ($Action) {")
+            .expect("dispatcher survived the adapter");
+        for name in ["Invoke-ClaudeCnFontPatch", "Invoke-ClaudeCnFontOnly"] {
+            let definition = output
+                .find(&format!("function {name}"))
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(
+                definition < dispatcher,
+                "{name} must precede the dispatcher"
+            );
+        }
+        assert!(output.contains("\"font\" { Invoke-ClaudeCnFontOnly }"));
+        assert!(output.contains("CLAUDE_CN_FONT_STAGE"));
+        assert!(output.contains("if ($env:CLAUDE_CN_FONT_STAGE) { Invoke-ClaudeCnFontPatch"));
         if !source.contains("Disable-FridaResidentForDiskInstall") {
             let legacy =
                 "function Disable-FridaResidentForDiskInstall { throw 'legacy side effect' }";
@@ -1322,6 +1654,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
             architecture: "X64".into(),
             package_full_name: "Claude_2.7032.0.0_x64__pzs8sxrjxfjjc".into(),
             package_family_name: "Claude_pzs8sxrjxfjjc".into(),
+            kind: ClaudeTargetKind::Appx,
             install_location: package_root.display().to_string(),
         };
         let original_exe = util::sha256(&package.exe()).unwrap();
@@ -1471,7 +1804,8 @@ exit $LASTEXITCODE
         fs::create_dir_all(&root).unwrap();
         assert!(!has_localization_assets(&root));
         fs::create_dir(root.join(".zh-cn-backups")).unwrap();
-        assert!(has_localization_assets(&root));
+        // Font-only runs leave backups here; they are not a foreign install.
+        assert!(!has_localization_assets(&root));
         assert!(unique_backup_set(&root.join(".zh-cn-backups")).is_err());
         fs::create_dir(root.join(".zh-cn-backups").join("only-set")).unwrap();
         assert!(unique_backup_set(&root.join(".zh-cn-backups")).is_ok());
@@ -1481,6 +1815,23 @@ exit $LASTEXITCODE
         let i18n = root.join("ion-dist").join("i18n");
         fs::create_dir_all(&i18n).unwrap();
         fs::write(i18n.join("zh-CN.json"), "{}").unwrap();
+        assert!(has_localization_assets(&root));
+
+        // The same file inside the archive counts as well.
+        fs::remove_dir_all(root.join("ion-dist")).unwrap();
+        let index = serde_json::json!({
+            "files": {"i18n": {"files": {"zh-CN.json": {"size": 2, "offset": "0"}}}}
+        });
+        let mut json = serde_json::to_vec(&index).unwrap();
+        let padding = (4 - json.len() % 4) % 4;
+        json.extend(vec![b' '; padding]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&((json.len() + 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(index.to_string().len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        fs::write(root.join("ion-dist.asar"), bytes).unwrap();
         assert!(has_localization_assets(&root));
         fs::remove_dir_all(root).unwrap();
     }

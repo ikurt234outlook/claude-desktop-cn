@@ -3,9 +3,13 @@ mod assistant;
 #[cfg_attr(target_os = "macos", path = "macos/claude.rs")]
 mod claude;
 mod engine_cache;
+#[cfg(windows)]
+mod fonts;
 mod operation;
 #[cfg_attr(target_os = "macos", path = "macos/patch.rs")]
 mod patch;
+#[cfg(windows)]
+mod portable;
 #[cfg_attr(target_os = "macos", path = "macos/self_update.rs")]
 mod self_update;
 #[cfg_attr(target_os = "macos", path = "macos/util.rs")]
@@ -163,6 +167,57 @@ fn choose_assistant_install_path() -> Result<Option<String>, String> {
     assistant::choose_install_path()
 }
 
+#[cfg(windows)]
+#[tauri::command]
+fn choose_claude_portable_path() -> Result<Option<String>, String> {
+    assistant::choose_folder("选择 Claude 便携安装目录")
+}
+
+/// System families plus the fonts the user imported, for the font pickers.
+#[cfg(windows)]
+#[tauri::command]
+fn get_font_state() -> Result<fonts::FontState, String> {
+    fonts::state()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn save_font_settings(settings: fonts::FontSettings) -> Result<fonts::FontSettings, String> {
+    fonts::save_settings(settings)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn import_font_file() -> Result<Option<fonts::ImportedFont>, String> {
+    let Some(path) = assistant::choose_font_file()? else {
+        return Ok(None);
+    };
+    fonts::import_font(std::path::Path::new(&path)).map(Some)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn remove_font(id: String) -> Result<fonts::FontSettings, String> {
+    fonts::remove_font(&id)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn get_portable_state() -> Result<PortableState, String> {
+    Ok(PortableState {
+        record: portable::record()?,
+        developer_mode: portable::developer_mode(),
+    })
+}
+
+#[cfg(windows)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableState {
+    record: Option<portable::PortableRecord>,
+    developer_mode: bool,
+}
+
 #[cfg(target_os = "windows")]
 fn set_windows_taskbar_icon(hwnd: windows_sys::Win32::Foundation::HWND) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -205,6 +260,8 @@ fn clean_caches() {
         ]
         .concat(),
     );
+    #[cfg(windows)]
+    errors.extend(portable::clean_cache(&data));
     util::record_cleanup_errors(&data, &errors);
 }
 
@@ -255,6 +312,18 @@ pub fn run() {
             open_data_dir,
             open_claude,
             choose_assistant_install_path,
+            #[cfg(windows)]
+            choose_claude_portable_path,
+            #[cfg(windows)]
+            get_font_state,
+            #[cfg(windows)]
+            save_font_settings,
+            #[cfg(windows)]
+            import_font_file,
+            #[cfg(windows)]
+            remove_font,
+            #[cfg(windows)]
+            get_portable_state,
         ])
         .run(context)
         .expect("failed to run app");

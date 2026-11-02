@@ -275,6 +275,18 @@ pub fn follow_moved_portable_folder() -> Result<(), String> {
     save_installed_record(&record)
 }
 
+/// The stored path is compared against values Windows reports elsewhere
+/// (shortcut targets, Appx records), which always use backslashes.
+fn normalize_config(mut config: AssistantConfig) -> AssistantConfig {
+    let trimmed = config.assistant_path.trim().trim_end_matches(['\\', '/']);
+    config.assistant_path = if cfg!(windows) {
+        trimmed.replace('/', "\\")
+    } else {
+        trimmed.to_string()
+    };
+    config
+}
+
 pub fn load_config() -> Result<AssistantConfig, String> {
     let path = config_path()?;
     if !path.exists() {
@@ -290,10 +302,11 @@ pub fn load_config() -> Result<AssistantConfig, String> {
     let config =
         serde_json::from_str(&raw).map_err(|error| format!("助手设置格式无效：{error}"))?;
     validate_config(&config)?;
-    Ok(config)
+    Ok(normalize_config(config))
 }
 
 pub fn save_config(config: AssistantConfig) -> Result<AssistantConfig, String> {
+    let config = normalize_config(config);
     validate_config(&config)?;
     let was_enabled = load_config()
         .map(|previous| previous.daily_update_check)
@@ -516,21 +529,23 @@ $target={target}
 $manifest={manifest}
 $desktop={desktop}
 $shell=New-Object -ComObject WScript.Shell
+# Wizard-written entries may carry forward slashes; compare the resolved paths.
+function SamePath([string]$a,[string]$b) {{ if (-not $a -or -not $b) {{ return $false }}; try {{ [IO.Path]::GetFullPath($a.Trim()) -ieq [IO.Path]::GetFullPath($b.Trim()) }} catch {{ $false }} }}
 $link=Join-Path $desktop 'Claude Windows 中文助手.lnk'
 if ({shortcut} -and (Test-Path -LiteralPath $link)) {{
-    if ($shell.CreateShortcut($link).TargetPath -ne $target) {{ throw '同名桌面快捷方式不属于本助手目标。' }}
+    if (-not (SamePath $shell.CreateShortcut($link).TargetPath $target)) {{ throw '同名桌面快捷方式不属于本助手目标。' }}
 }}
 if ({registered}) {{
     $programs=if ({system}) {{ [Environment]::GetFolderPath('CommonPrograms') }} else {{ [Environment]::GetFolderPath('Programs') }}
     if (-not $programs) {{ throw '无法确定开始菜单目录。' }}
     $menu=Join-Path $programs 'Claude Windows 中文助手.lnk'
     if (Test-Path -LiteralPath $menu) {{
-        if ($shell.CreateShortcut($menu).TargetPath -ne $target) {{ throw '同名开始菜单快捷方式不属于本助手目标。' }}
+        if (-not (SamePath $shell.CreateShortcut($menu).TargetPath $target)) {{ throw '同名开始菜单快捷方式不属于本助手目标。' }}
     }}
     $key={registry}
     if (Test-Path -LiteralPath $key) {{
         $entry=Get-ItemProperty -Path $key
-        if ($entry.InstallLocation -ne $dest -or $entry.DisplayIcon -ne $target) {{ throw '同名卸载项不属于本助手目标。' }}
+        if (-not (SamePath $entry.InstallLocation $dest) -or -not (SamePath $entry.DisplayIcon $target)) {{ throw '同名卸载项不属于本助手目标。' }}
     }}
 }}
 New-Item -ItemType Directory -Path $dest -Force | Out-Null
@@ -656,7 +671,8 @@ $exe=Join-Path $dest {exe}
 $manifest=Join-Path $dest 'install.json'
 $link={link}
 $shell=New-Object -ComObject WScript.Shell
-$removeLink=(Test-Path -LiteralPath $link) -and ($shell.CreateShortcut($link).TargetPath -eq $exe)
+function SamePath([string]$a,[string]$b) {{ if (-not $a -or -not $b) {{ return $false }}; try {{ [IO.Path]::GetFullPath($a.Trim()) -ieq [IO.Path]::GetFullPath($b.Trim()) }} catch {{ $false }} }}
+$removeLink=(Test-Path -LiteralPath $link) -and (SamePath $shell.CreateShortcut($link).TargetPath $exe)
 $removeMenu=$false
 $removeKey=$false
 if ({registered}) {{
@@ -664,13 +680,13 @@ if ({registered}) {{
     if (-not $programs) {{ throw '无法确定开始菜单目录。' }}
     $menu=Join-Path $programs 'Claude Windows 中文助手.lnk'
     if (Test-Path -LiteralPath $menu) {{
-        if ($shell.CreateShortcut($menu).TargetPath -ne $exe) {{ throw '同名开始菜单快捷方式不属于本助手目标。' }}
+        if (-not (SamePath $shell.CreateShortcut($menu).TargetPath $exe)) {{ throw '同名开始菜单快捷方式不属于本助手目标。' }}
         $removeMenu=$true
     }}
     $key={registry}
     if (Test-Path -LiteralPath $key) {{
         $entry=Get-ItemProperty -Path $key
-        if ($entry.InstallLocation -ne $dest -or $entry.DisplayIcon -ne $exe) {{ throw '同名卸载项不属于本助手目标。' }}
+        if (-not (SamePath $entry.InstallLocation $dest) -or -not (SamePath $entry.DisplayIcon $exe)) {{ throw '同名卸载项不属于本助手目标。' }}
         $removeKey=$true
     }}
 }}
@@ -839,7 +855,24 @@ Remove-Item -LiteralPath {work} -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 pub fn choose_install_path() -> Result<Option<String>, String> {
-    let script = "Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description='选择助手安装目录'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.SelectedPath }";
+    choose_folder("选择助手安装目录")
+}
+
+pub fn choose_folder(prompt: &str) -> Result<Option<String>, String> {
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description={}; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ $dialog.SelectedPath }}",
+        util::ps_quote(prompt)
+    );
+    let selected = util::powershell(&script)?;
+    Ok(if selected.is_empty() {
+        None
+    } else {
+        Some(selected)
+    })
+}
+
+pub fn choose_font_file() -> Result<Option<String>, String> {
+    let script = "Add-Type -AssemblyName System.Windows.Forms; $dialog=New-Object System.Windows.Forms.OpenFileDialog; $dialog.Title='选择字体文件'; $dialog.Filter='字体文件 (*.ttf;*.otf;*.woff2)|*.ttf;*.otf;*.woff2'; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.FileName }";
     let selected = util::powershell(script)?;
     Ok(if selected.is_empty() {
         None

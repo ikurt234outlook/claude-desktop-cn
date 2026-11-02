@@ -10,6 +10,10 @@ use std::{
 };
 
 pub const CANCELLED_MESSAGE: &str = "下载已取消，已删除未完成的临时文件。";
+#[cfg(not(windows))]
+const PORTABLE_UNAVAILABLE: &str = "便携安装目前仅支持 Windows。";
+#[cfg(not(windows))]
+const FONTS_UNAVAILABLE: &str = "自定义字体目前仅支持 Windows。";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,10 +127,13 @@ impl OperationState {
         const KINDS: &[&str] = &[
             "install_assistant",
             "install_claude",
+            "install_claude_portable",
             "check_claude_update",
             "update_claude",
             "apply_patch",
             "restore_patch",
+            "apply_fonts",
+            "restore_fonts",
             "create_claude_shortcut",
             "check_assistant_update",
             "install_assistant_update",
@@ -143,6 +150,14 @@ impl OperationState {
         } else {
             None
         };
+        // The portable target and source are chosen in the UI before the
+        // operation starts, so an install can never run without a destination.
+        if kind == "install_claude_portable" {
+            let target = mode.unwrap_or_default().to_string();
+            if target.trim().is_empty() {
+                return Err("请选择便携安装目录。".into());
+            }
+        }
         let mut current = self.lock();
         if current.state == "running" {
             return Err("已有操作正在执行，请等待完成。".into());
@@ -170,6 +185,18 @@ impl OperationState {
                 }
                 "uninstall_assistant" => assistant::uninstall(&worker),
                 "install_claude" => claude::install(&worker, false),
+                #[cfg(windows)]
+                "install_claude_portable" => {
+                    crate::portable::install_target(mode.as_deref().unwrap_or_default(), &worker)
+                }
+                #[cfg(not(windows))]
+                "install_claude_portable" => Err(PORTABLE_UNAVAILABLE.into()),
+                #[cfg(windows)]
+                "apply_fonts" => crate::fonts::apply(&worker),
+                #[cfg(windows)]
+                "restore_fonts" => crate::fonts::restore(&worker),
+                #[cfg(not(windows))]
+                "apply_fonts" | "restore_fonts" => Err(FONTS_UNAVAILABLE.into()),
                 "update_claude" => claude::install(&worker, true)
                     .and_then(|outcome| reapply_after_update(outcome, &worker)),
                 "check_claude_update" => claude::check_update(&worker),

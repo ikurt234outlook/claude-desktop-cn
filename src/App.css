@@ -111,6 +111,13 @@
     #claude-assistant-sketch .ca-path-row input { min-width:0; width:100%; height:39px; padding:9px 12px; border:1px solid var(--ca-line); border-radius:7px; background:var(--ca-surface); font-size:13px; }
     #claude-assistant-sketch .ca-install-check { display:flex; align-items:center; gap:9px; margin-top:24px; font-size:13px; }
     #claude-assistant-sketch .ca-install-check input { width:15px; height:15px; margin:0; accent-color:var(--ca-accent); }
+    #claude-assistant-sketch .ca-font-row { display:grid; grid-template-columns:96px minmax(0,1fr); align-items:center; gap:12px; margin-top:12px; font-size:13px; }
+    #claude-assistant-sketch .ca-font-row > label { color:var(--ca-muted); }
+    #claude-assistant-sketch .ca-font-imported { margin-top:12px; }
+    #claude-assistant-sketch .ca-font-imported > .ca-section-title { margin:16px 0 0 0; display:flex; align-items:center; gap:7px; }
+    #claude-assistant-sketch .ca-install-source { margin-top:16px; }
+    #claude-assistant-sketch .ca-install-check[data-disabled="true"] { color:var(--ca-muted); }
+    #claude-assistant-sketch .ca-install-page .ca-install-actions { gap:12px; }
     #claude-assistant-sketch .ca-install-actions { margin-top:auto; padding:20px 0 0; display:flex; justify-content:flex-end; }
     #claude-assistant-sketch .ca-install-actions .ca-button { min-width:108px; }
     #claude-assistant-sketch .ca-confirm p:empty { display:none; }

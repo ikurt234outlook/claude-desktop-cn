@@ -1,26 +1,33 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window'
-import { ArrowRight, Check, ClipboardCopy, Copy, Download, FolderOpen, Info, Languages, LayoutDashboard, Minus, Play, RefreshCw, Settings2, Square, TriangleAlert, X } from 'lucide-react'
+import { ArrowRight, Check, ClipboardCopy, Copy, Download, FolderOpen, Info, Languages, LayoutDashboard, Minus, Play, RefreshCw, Settings2, Square, Trash2, TriangleAlert, Type, Upload, X } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import './App.css'
 
-type Page = 'startup' | 'setup' | 'overview' | 'localize' | 'settings' | 'operation'
-type MainPage = 'overview' | 'localize' | 'settings'
+type Page = 'startup' | 'setup' | 'install' | 'overview' | 'localize' | 'fonts' | 'settings' | 'operation'
+type MainPage = 'install' | 'overview' | 'localize' | 'fonts' | 'settings'
 type InstallMode = 'portable' | 'user' | 'system'
 type StoredPatchMode = 'safe' | 'full'
 type Platform = 'windows' | 'macos'
 type OperationKind =
-  | 'install_assistant' | 'install_claude' | 'check_claude_update' | 'update_claude'
-  | 'apply_patch' | 'restore_patch' | 'create_claude_shortcut'
+  | 'install_assistant' | 'install_claude' | 'install_claude_portable' | 'check_claude_update' | 'update_claude'
+  | 'apply_patch' | 'restore_patch' | 'apply_fonts' | 'restore_fonts' | 'create_claude_shortcut'
   | 'check_assistant_update' | 'install_assistant_update' | 'uninstall_assistant'
 
+type ClaudeTargetKind = 'appx' | 'portable'
+type ImportedFont = { id: string; label: string; file: string; format: string }
+type FontSettings = { uiFamily: string; chatFamily: string; cjkFamily: string; imported: ImportedFont[] }
+type FontState = { settings: FontSettings; available: string[]; applied: boolean }
+type PortableRecord = { installLocation: string; version: string; registered: boolean; packageFamilyName: string }
+type PortableState = { record: PortableRecord | null; developerMode: boolean }
 type ClaudeStatus = {
   installed: boolean
   version: string
   packageFullName: string
   installPath: string
+  kind: ClaudeTargetKind
   appliedMode: StoredPatchMode | null
   backupReady: boolean
   externalLocalization: boolean
@@ -52,6 +59,11 @@ type AssistantStatus = {
   updateResultOk?: boolean | null
   uninstallResult?: string | null
   uninstallResultOk?: boolean | null
+}
+type ClaudeInstallOptions = {
+  path: string
+  source: 'mirror' | 'github' | 'official'
+  register: boolean
 }
 type AssistantConfig = {
   assistantInstallMode: InstallMode
@@ -95,6 +107,9 @@ const operationTitles: Record<OperationKind, string> = {
   update_claude: '正在更新 Claude',
   apply_patch: '正在汉化 Claude',
   restore_patch: '正在恢复原样',
+  install_claude_portable: '正在安装便携版 Claude',
+  apply_fonts: '正在应用字体',
+  restore_fonts: '正在恢复默认字体',
   create_claude_shortcut: '正在创建 Claude 快捷方式',
   check_assistant_update: '正在检查助手更新',
   install_assistant_update: '正在更新助手',
@@ -103,13 +118,16 @@ const operationTitles: Record<OperationKind, string> = {
 const confirmationLabels: Partial<Record<OperationKind, string>> = {
   apply_patch: '关闭 Claude 并汉化',
   restore_patch: '恢复原样',
+  install_claude_portable: '安装便携版',
+  apply_fonts: '应用字体',
+  restore_fonts: '恢复默认字体',
   install_claude: '安装 Claude',
   update_claude: '安装更新',
   install_assistant_update: '安装更新',
   uninstall_assistant: '卸载助手',
 }
 // Successful results worth reporting after returning from the operation page.
-const noticeKinds: OperationKind[] = ['install_claude', 'update_claude', 'apply_patch', 'restore_patch', 'create_claude_shortcut']
+const noticeKinds: OperationKind[] = ['install_claude', 'install_claude_portable', 'update_claude', 'apply_patch', 'restore_patch', 'apply_fonts', 'restore_fonts', 'create_claude_shortcut']
 const modeNames: Record<StoredPatchMode, string> = { safe: '本地界面汉化', full: '旧版汉化' }
 
 const defaultConfig: AssistantConfig = {
@@ -142,6 +160,7 @@ function checkedAgo(epoch: string | null | undefined): string {
 
 function returnPage(kind: OperationKind): MainPage {
   if (kind === 'apply_patch' || kind === 'restore_patch') return 'localize'
+  if (kind === 'apply_fonts' || kind === 'restore_fonts') return 'fonts'
   if (kind === 'check_assistant_update' || kind === 'install_assistant_update' || kind === 'create_claude_shortcut' || kind === 'uninstall_assistant') return 'settings'
   return 'overview'
 }
@@ -190,6 +209,11 @@ function App() {
   const [assistant, setAssistant] = useState<AssistantStatus | null>(null)
   const [claude, setClaude] = useState<ClaudeStatus | null>(null)
   const [config, setConfig] = useState(defaultConfig)
+  const [fonts, setFonts] = useState<FontState | null>(null)
+  const [fontDraft, setFontDraft] = useState<FontSettings | null>(null)
+  const [portable, setPortable] = useState<PortableState | null>(null)
+  const [installOptions, setInstallOptions] = useState<ClaudeInstallOptions>({ path: '', source: 'github', register: false })
+  const [installError, setInstallError] = useState('')
   const [page, setPage] = useState<Page>('startup')
   const [operation, setOperation] = useState<OperationSnapshot | null>(null)
   const [retry, setRetry] = useState<{ kind: OperationKind; mode?: 'safe' } | null>(null)
@@ -230,7 +254,7 @@ function App() {
   const assistantUpdate = assistant?.updateAvailable == null ? null : { available: assistant.updateAvailable, version: assistant.latestVersion ?? '' }
   const claudeChecking = Boolean(claude?.updateChecking)
   const assistantChecking = Boolean(assistant?.updateChecking)
-  const title = page === 'startup' ? 'Claude 中文助手' : page === 'setup' ? '安装 Claude 中文助手' : page === 'overview' ? '概览' : page === 'localize' ? '汉化' : page === 'settings' ? '设置' : operationCancelled ? '已取消' : operation?.state === 'error' ? '操作失败' : operation ? operationTitles[operation.kind] : '执行'
+  const title = page === 'startup' ? 'Claude 中文助手' : page === 'setup' ? '安装 Claude 中文助手' : page === 'install' ? '安装 Claude' : page === 'overview' ? '概览' : page === 'localize' ? '汉化' : page === 'fonts' ? '字体' : page === 'settings' ? '设置' : operationCancelled ? '已取消' : operation?.state === 'error' ? '操作失败' : operation ? operationTitles[operation.kind] : '执行'
 
   const flashCopied = (key: string) => {
     setCopied(key)
@@ -238,7 +262,30 @@ function App() {
     copiedTimer.current = window.setTimeout(() => setCopied(''), 1800)
   }
 
+  const refreshFonts = useCallback(async () => {
+    try {
+      const state = await invoke<FontState>('get_font_state')
+      setFonts(state)
+      setFontDraft(state.settings)
+    } catch (error) {
+      // Font enumeration is unavailable on macOS builds; the page stays hidden.
+      setFonts(null)
+      setFontDraft(null)
+      void error
+    }
+  }, [])
+
+  const refreshPortable = useCallback(async () => {
+    try {
+      setPortable(await invoke<PortableState>('get_portable_state'))
+    } catch {
+      setPortable(null)
+    }
+  }, [])
+
   const refreshStatus = useCallback(async () => {
+    void refreshFonts()
+    void refreshPortable()
     const [assistantResult, claudeResult] = await Promise.allSettled([
       invoke<AssistantStatus>('get_assistant_status'),
       invoke<ClaudeStatus>('get_status'),
@@ -255,7 +302,7 @@ function App() {
     setLoadError(errors.join('；'))
     if (errors.length) throw new Error(errors.join('；'))
     return assistantResult.status === 'fulfilled' ? assistantResult.value : null
-  }, [])
+  }, [refreshFonts, refreshPortable])
 
   const loadStartup = useCallback(() => {
     setPage('startup')
@@ -274,14 +321,16 @@ function App() {
         startupTimer.current = null
         setLoadError('读取助手状态超时，请重新检测。')
       }
-    }, 10_000)
+    }, 20_000)
     void Promise.allSettled([
       invoke<AssistantStatus>('get_assistant_status'),
       invoke<ClaudeStatus>('get_status'),
       invoke<AssistantConfig>('get_config'),
       invoke<OperationSnapshot>('get_operation_snapshot'),
       invoke<Platform>('get_platform'),
-    ]).then(([assistantResult, claudeResult, configResult, operationResult, platformResult]) => {
+      invoke<FontState>('get_font_state'),
+      invoke<PortableState>('get_portable_state'),
+    ]).then(([assistantResult, claudeResult, configResult, operationResult, platformResult, fontResult, portableResult]) => {
       if (attempt !== startupAttempt.current) return
       const errors: string[] = []
       if (assistantResult.status === 'rejected') errors.push(`助手状态：${errorText(assistantResult.reason)}`)
@@ -295,6 +344,11 @@ function App() {
       }
       if (assistantResult.status === 'fulfilled' && claudeResult.status === 'fulfilled' && configResult.status === 'fulfilled' && operationResult.status === 'fulfilled') {
         if (platformResult.status === 'fulfilled') setPlatform(platformResult.value)
+        if (fontResult.status === 'fulfilled') {
+          setFonts(fontResult.value)
+          setFontDraft(fontResult.value.settings)
+        }
+        if (portableResult.status === 'fulfilled') setPortable(portableResult.value)
         setAssistant(assistantResult.value)
         setClaude(claudeResult.value)
         const loaded = configResult.value
@@ -581,6 +635,108 @@ function App() {
     void refreshStatus().catch(() => {})
   }
 
+  const choosePortablePath = async () => {
+    try {
+      const path = await invoke<string | null>('choose_claude_portable_path')
+      if (path) setInstallOptions((current) => ({ ...current, path }))
+    } catch (error) {
+      setInstallError(`无法选择安装位置：${errorText(error)}`)
+    }
+  }
+
+  const startPortableInstall = () => {
+    const path = installOptions.path.trim()
+    if (!path) {
+      setInstallError('请先选择便携安装目录。')
+      return
+    }
+    setInstallError('')
+    const mode = `${path}|${installOptions.source}|${installOptions.register ? '1' : '0'}`
+    setConfirm({
+      title: '安装便携版 Claude？',
+      text: `将下载官方 MSIX 并解压到 ${path}，不会修改已有的官方安装；若该目录已有便携版，则接管而不重新下载。${installOptions.register ? '安装后会注册 AppX 以启用 Cowork，需要管理员授权与 Windows 开发者模式。' : ''}`,
+      accept: '安装便携版',
+      action: () => { void startPortableOperation(mode) },
+    })
+  }
+
+  const startPortableOperation = async (mode: string) => {
+    setConfirm(null)
+    setLogsExpanded(false)
+    setActionError('')
+    setNotice('')
+    setRetry({ kind: 'install_claude_portable' })
+    handledOperation.current = null
+    setPage('operation')
+    setOperation({ id: -Date.now(), kind: 'install_claude_portable', step: '正在准备', progress: null, logs: [], state: 'running', message: '', updateAvailable: null, latestVersion: null })
+    try {
+      const snapshot = await invoke<OperationSnapshot>('start_operation', { kind: 'install_claude_portable', mode })
+      setOperation(snapshot)
+    } catch (error) {
+      const message = errorText(error)
+      setOperation({ id: -Date.now(), kind: 'install_claude_portable', step: message, progress: null, logs: [message], state: 'error', message, updateAvailable: null, latestVersion: null })
+    }
+  }
+
+  const importFont = async () => {
+    try {
+      const font = await invoke<ImportedFont | null>('import_font_file')
+      if (font) await refreshFonts()
+    } catch (error) {
+      setActionError(`导入字体失败：${errorText(error)}`)
+    }
+  }
+
+  const removeFont = async (id: string) => {
+    try {
+      const settings = await invoke<FontSettings>('remove_font', { id })
+      setFontDraft(settings)
+      await refreshFonts()
+    } catch (error) {
+      setActionError(`移除字体失败：${errorText(error)}`)
+    }
+  }
+
+  const saveFonts = async (apply: boolean) => {
+    if (!fontDraft) return
+    setActionError('')
+    try {
+      await invoke<FontSettings>('save_font_settings', { settings: fontDraft })
+      await refreshFonts()
+      if (apply) {
+        await startOperation('apply_fonts')
+      } else {
+        setNotice('字体设置已保存，应用后生效。')
+      }
+    } catch (error) {
+      setActionError(`保存字体设置失败：${errorText(error)}`)
+    }
+  }
+
+  const confirmFonts = () => {
+    if (!fontDraft) return
+    const changed = fonts && JSON.stringify(fonts.settings) !== JSON.stringify(fontDraft)
+    if (!changed) {
+      void startOperation('apply_fonts')
+      return
+    }
+    setConfirm({
+      title: '应用字体？',
+      text: '将关闭 Claude，重写本地前端的字体样式后重新打开。只影响本地界面，在线 claude.ai 页面不受影响。',
+      accept: '应用字体',
+      action: () => { void saveFonts(true) },
+    })
+  }
+
+  const fontFamilyLabel = (value: string) => {
+    if (!value) return 'Claude 默认'
+    if (value.startsWith('import:')) {
+      const id = value.slice('import:'.length)
+      return fontDraft?.imported.find((font) => font.id === id)?.label ?? '导入字体（缺失）'
+    }
+    return value
+  }
+
   const confirmAction = (title: string, text: string, kind: OperationKind, mode?: 'safe') => {
     setConfirm({ title, text, accept: confirmationLabels[kind] ?? title, action: () => { void startOperation(kind, mode) } })
   }
@@ -632,6 +788,7 @@ function App() {
             {assistant?.installed && page !== 'startup' ? <nav className="ca-nav" aria-label="主导航">
               <button type="button" onClick={() => navigate('overview')} aria-current={activePage === 'overview' ? 'page' : undefined} disabled={busy || Boolean(loadError)}><LayoutDashboard aria-hidden="true" /><span>概览</span>{claude?.installed && claude.updateAvailable ? <i className="ca-dot" role="img" aria-label="有更新" /> : null}</button>
               <button type="button" onClick={() => navigate('localize')} aria-current={activePage === 'localize' ? 'page' : undefined} disabled={busy || Boolean(loadError)}><Languages aria-hidden="true" /><span>汉化</span>{staleMode || claude?.patchRecoveryRequired ? <i className="ca-dot" role="img" aria-label="需要处理" /> : null}</button>
+              <button type="button" onClick={() => navigate('fonts')} aria-current={activePage === 'fonts' ? 'page' : undefined} disabled={busy || Boolean(loadError) || platform !== 'windows'}><Type aria-hidden="true" /><span>字体</span></button>
               <button type="button" onClick={() => navigate('settings')} aria-current={activePage === 'settings' ? 'page' : undefined} disabled={busy || Boolean(loadError)}><Settings2 aria-hidden="true" /><span>设置</span>{assistantUpdate?.available ? <i className="ca-dot" role="img" aria-label="助手有新版本" /> : null}</button>
             </nav> : null}
           </aside>
@@ -639,7 +796,7 @@ function App() {
             {page !== 'overview' ? <header className="ca-heading">
               <div>
                 <h1>{title}</h1>
-                {page === 'localize' || page === 'settings' ? <p className="ca-heading-subtitle">{page === 'localize' ? '简体中文补丁与恢复' : '偏好设置与助手信息'}</p> : null}
+                {page === 'localize' || page === 'settings' || page === 'fonts' || page === 'install' ? <p className="ca-heading-subtitle">{page === 'localize' ? '简体中文补丁与恢复' : page === 'fonts' ? '界面与聊天字体，仅作用于本地前端' : page === 'install' ? '便携安装或官方安装' : '偏好设置与助手信息'}</p> : null}
               </div>
             </header> : null}
             {page === 'startup' && loadError ? <div className="ca-startup"><p role="alert">{loadError}</p><button type="button" className="ca-button" onClick={loadStartup}>重新检测</button></div> : null}
@@ -668,7 +825,7 @@ function App() {
             {page === 'overview' ? <section className="ca-pane ca-overview" aria-label="概览">
               {noticeBanner}
               <div className="ca-hero"><img src="/claude-icon.svg" className="ca-app-icon" alt="" /><div className="ca-hero-copy"><h2>Claude Desktop</h2><div className="ca-version"><span className="ca-state" data-ok={Boolean(claude?.installed)}>{claude ? claude.installed ? '已安装' : '尚未安装' : '正在检测'}</span>{claude?.installed ? <span>{claude.version || '未知版本'}</span> : null}</div></div>
-                <button type="button" className="ca-button ca-primary ca-launch" onClick={() => claude?.installed ? void openClaude() : confirmAction('安装 Claude', `将下载并安装官方 ${platform === 'macos' ? 'macOS' : 'Windows'} 应用。`, 'install_claude')} disabled={busy || !claude}>{claude?.installed ? <Play aria-hidden="true" /> : <Download aria-hidden="true" />}<span>{claude?.installed ? '打开 Claude' : '安装 Claude'}</span></button>
+                <button type="button" className="ca-button ca-primary ca-launch" onClick={() => claude?.installed ? void openClaude() : platform === 'windows' ? navigate('install') : confirmAction('安装 Claude', '将下载并安装官方 macOS 应用。', 'install_claude')} disabled={busy || !claude}>{claude?.installed ? <Play aria-hidden="true" /> : <Download aria-hidden="true" />}<span>{claude?.installed ? '打开 Claude' : '安装 Claude'}</span></button>
               </div>
               {claude?.updateAvailable && claude.installed && !dismissedUpdates.includes(claudeUpdateKey) ? <div className="ca-banner"><div><h3>Claude 有新版本</h3><p>{claude.version || '当前版本'} → {claude.latestVersion}{claude.appliedMode && config.autoReapplyPatch ? '；更新后自动重新应用汉化' : ''}</p></div><div className="ca-banner-actions">{laterButton(claudeUpdateKey)}<button type="button" className="ca-button ca-primary" onClick={() => confirmAction('更新 Claude？', `安装过程中会关闭 Claude，请先保存正在进行的工作。${claude.appliedMode ? config.autoReapplyPatch ? `更新完成后会应用本地界面汉化${platform === 'windows' ? '，可能请求管理员授权' : ''}。` : '官方更新会覆盖当前汉化，之后可在汉化页重新应用。' : ''}`, 'update_claude')} disabled={busy}><Download aria-hidden="true" />立即更新</button></div></div> : null}
               {assistantUpdate?.available && !dismissedUpdates.includes(assistantUpdateKey) ? <div className="ca-banner" data-tone="quiet"><div><h3>助手有新版本</h3><p>{assistant?.version || '当前版本'} → {assistantUpdate.version}</p></div><div className="ca-banner-actions">{laterButton(assistantUpdateKey)}<button type="button" className="ca-button" onClick={() => navigate('settings')} disabled={busy}>查看并更新<ArrowRight aria-hidden="true" /></button></div></div> : null}
@@ -677,6 +834,94 @@ function App() {
                 <div className="ca-row"><span className="ca-row-icon"><Download aria-hidden="true" /></span><div><h3>应用更新</h3>{claude?.installed ? <p>{claudeChecking ? '正在检查更新…' : <>{claude.updateCheckError || (claude.updateAvailable != null ? claude.updateAvailable ? '已发现新版本，可随时更新' : '已是最新版本' : '尚未检查最新版本')}{claudeChecked ? <span className="ca-checked"> · {claudeChecked}</span> : null}</>}</p> : <p>安装 Claude 后可检查更新</p>}</div>{claude?.installed ? <button type="button" className="ca-text-button" onClick={() => void startOperation('check_claude_update')} disabled={busy || claudeChecking}><RefreshCw aria-hidden="true" />检查更新</button> : null}</div>
                 <div className="ca-row"><span className="ca-row-icon"><Languages aria-hidden="true" /></span><div><h3>中文界面</h3><p data-warning={Boolean(claude?.patchRecoveryRequired || staleMode)}>{localizeCopy}</p></div>{claude?.installed ? <button type="button" className="ca-text-button" onClick={() => navigate('localize')} disabled={busy}>前往汉化<ArrowRight aria-hidden="true" /></button> : null}</div>
               </div>
+            </section> : null}
+
+            {page === 'install' ? <section className="ca-pane ca-install-page" aria-label="安装 Claude">
+              {noticeBanner}
+              <div className="ca-card">
+                <div className="ca-settings-row"><div><h3>便携安装</h3><p>下载官方 MSIX 并解压到指定目录，可整体移动；不改动已有的官方安装。</p></div></div>
+                <div className="ca-install-label"><label htmlFor="ca-portable-path">安装位置</label></div>
+                <div className="ca-path-row">
+                  <input id="ca-portable-path" value={installOptions.path} placeholder="例如 D:\Claude" aria-label="Claude 便携安装位置" onChange={(event) => setInstallOptions((current) => ({ ...current, path: event.target.value }))} disabled={busy} />
+                  <button type="button" className="ca-button" onClick={() => void choosePortablePath()} disabled={busy}>浏览…</button>
+                </div>
+                <div className="ca-install-label ca-install-source"><label htmlFor="ca-portable-source">下载源</label></div>
+                <select id="ca-portable-source" className="ca-install-select" value={installOptions.source} onChange={(event) => setInstallOptions((current) => ({ ...current, source: event.target.value as ClaudeInstallOptions['source'] }))} disabled={busy}>
+                  <option value="github">GitHub 镜像（推荐）</option>
+                  <option value="mirror">国内镜像</option>
+                  <option value="official">Anthropic 官方</option>
+                </select>
+                <p className="ca-install-hint">按顺序自动回退：所选源失败时尝试其余源。国内镜像可能落后于最新版本。</p>
+                <label className="ca-install-check" data-disabled={!portable?.developerMode}>
+                  <input type="checkbox" checked={installOptions.register} onChange={(event) => setInstallOptions((current) => ({ ...current, register: event.target.checked }))} disabled={busy || !portable?.developerMode} />
+                  注册 AppX 并启用 Cowork
+                </label>
+                <p className="ca-install-hint">{portable?.developerMode ? '需要管理员授权；安装后可像官方版一样启动，Cowork 可用。' : '当前未开启 Windows 开发者模式，只能以不注册的方式安装；Cowork 不可用。'}</p>
+                {installError ? <p className="ca-settings-message" data-error role="alert">{installError}</p> : null}
+                <div className="ca-install-actions">
+                  <button type="button" className="ca-button" onClick={() => navigate('overview')} disabled={busy}>返回概览</button>
+                  <button type="button" className="ca-button ca-primary" onClick={startPortableInstall} disabled={busy || !installOptions.path.trim()}>安装便携版</button>
+                </div>
+              </div>
+              <div className="ca-native-language-note">
+                <h3>官方安装</h3>
+                <p>也可在概览页直接安装或更新官方 Claude Desktop。两种安装互不影响，助手同时只管理其中一份。</p>
+              </div>
+            </section> : null}
+
+            {page === 'fonts' ? <section className="ca-pane ca-fonts-page" aria-label="字体">
+              {noticeBanner}
+              {!fontDraft || !fonts ? <p className="ca-label">正在读取字体信息…</p> : <>
+                <div className="ca-localization-card">
+                  <div className="ca-localization-header">
+                    <span className="ca-localization-icon"><Type aria-hidden="true" /></span>
+                    <div><h2>界面与聊天字体</h2><p>仅作用于本地前端，不改系统字体</p></div>
+                    {fonts.applied ? <span className="ca-applied" role="status"><Check aria-hidden="true" />已应用</span> : null}
+                  </div>
+                  <p className="ca-localization-description">通过覆盖 Claude 的字体变量生效，可选用任意已安装字体或导入字体文件。原生菜单、托盘和在线 claude.ai 页面不受影响。</p>
+                  <div className="ca-font-row">
+                    <label htmlFor="ca-font-ui">界面字体</label>
+                    <select id="ca-font-ui" className="ca-install-select" value={fontDraft.uiFamily} onChange={(event) => setFontDraft({ ...fontDraft, uiFamily: event.target.value })} disabled={busy}>
+                      <option value="">Claude 默认</option>
+                      {fontDraft.imported.map((font) => <option key={font.id} value={`import:${font.id}`}>导入：{font.label}</option>)}
+                      {fonts.available.map((family) => <option key={family} value={family}>{family}</option>)}
+                    </select>
+                  </div>
+                  <div className="ca-font-row">
+                    <label htmlFor="ca-font-chat">聊天字体</label>
+                    <select id="ca-font-chat" className="ca-install-select" value={fontDraft.chatFamily} onChange={(event) => setFontDraft({ ...fontDraft, chatFamily: event.target.value })} disabled={busy}>
+                      <option value="">Claude 默认</option>
+                      {fontDraft.imported.map((font) => <option key={font.id} value={`import:${font.id}`}>导入：{font.label}</option>)}
+                      {fonts.available.map((family) => <option key={family} value={family}>{family}</option>)}
+                    </select>
+                  </div>
+                  <div className="ca-font-row">
+                    <label htmlFor="ca-font-cjk">中文字体</label>
+                    <select id="ca-font-cjk" className="ca-install-select" value={fontDraft.cjkFamily} onChange={(event) => setFontDraft({ ...fontDraft, cjkFamily: event.target.value })} disabled={busy}>
+                      <option value="">跟随系统</option>
+                      {fontDraft.imported.map((font) => <option key={font.id} value={`import:${font.id}`}>导入：{font.label}</option>)}
+                      {fonts.available.map((family) => <option key={family} value={family}>{family}</option>)}
+                    </select>
+                  </div>
+                  <p className="ca-install-hint">代码字体请使用 Claude 自带的“代码字体”设置（设置 → Claude Code → 外观）。</p>
+                  <div className="ca-actions ca-localization-actions">
+                    <button type="button" className="ca-button ca-primary" onClick={confirmFonts} disabled={busy || !claude?.installed}><Type aria-hidden="true" />应用字体</button>
+                    <button type="button" className="ca-button" onClick={() => void importFont()} disabled={busy}><Upload aria-hidden="true" />导入字体文件</button>
+                    <button type="button" className="ca-text-button ca-localization-restore" onClick={() => confirmAction('恢复默认字体？', '将重写本地前端，移除自定义字体样式。汉化不受影响。', 'restore_fonts')} disabled={busy || !claude?.installed}>恢复默认</button>
+                  </div>
+                </div>
+                {fontDraft.imported.length ? <div className="ca-card ca-font-imported">
+                  <h3 className="ca-section-title"><Upload aria-hidden="true" />已导入</h3>
+                  {fontDraft.imported.map((font) => <div key={font.id} className="ca-settings-row">
+                    <div><h3>{font.label}</h3><p>{font.file}</p></div>
+                    <button type="button" className="ca-icon-button" aria-label={`移除 ${font.label}`} onClick={() => void removeFont(font.id)} disabled={busy}><Trash2 aria-hidden="true" /></button>
+                  </div>)}
+                </div> : null}
+                <div className="ca-native-language-note">
+                  <h3>当前选择</h3>
+                  <p>界面：{fontFamilyLabel(fontDraft.uiFamily)} · 聊天：{fontFamilyLabel(fontDraft.chatFamily)} · 中文：{fontFamilyLabel(fontDraft.cjkFamily)}</p>
+                </div>
+              </>}
             </section> : null}
 
             {page === 'localize' ? <section className="ca-pane ca-localize" aria-label="汉化">
